@@ -39,7 +39,7 @@ fake_users = [
 ]
 
 fake_products = [
-    Product(id=1, name="iPhone 15", price=25000000, category="Điện thoại", in_stock=True),
+    Product(id=1, name="iPhone 15", price=25000000, category="Điện thoạii", in_stock=True),
     Product(id=2, name="MacBook Pro", price=45000000, category="Laptop", in_stock=True),
     Product(id=3, name="Samsung Galaxy S24", price=22000000, category="Điện thoại", in_stock=False),
     Product(id=4, name="Dell XPS 13", price=35000000, category="Laptop", in_stock=True),
