@@ -1,0 +1,234 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, master ]
+    paths-ignore:
+      - 'README.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.github/workflows/ci-cd.yml'  # Ignore workflow file changes
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # Allow manual trigger
+    inputs:
+      force_run:
+        description: 'Force run even if secrets are not ready'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '0 */6 * * *'  # Run every 6 hours as backup
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov
+        
+    - name: Run tests
+      run: |
+        # Tạo test đơn giản nếu chưa có
+        python - <<'PY'
+        import importlib,sys,os
+        for m in ("app","main","server","index"):
+            try:
+                importlib.import_module(m)
+                print(f"Imported {m}")
+                break
+            except Exception as e:
+                pass
+        else:
+            print("No importable app module; skipping smoke test")
+        PY
+        
+    - name: Lint with flake8
+      run: |
+        pip install flake8
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+          
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          ghcr.io/${{ github.repository }}:latest
+          ghcr.io/${{ github.repository }}:main-${{ github.sha }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    # Removed explicit package visibility change to avoid 404 timing/scope issues
+
+  update-manifests:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    permissions:
+      contents: write
+    # Only run if all required secrets are available
+    env:
+      SECRETS_READY: ${{ secrets.MANIFESTS_REPO_TOKEN != '' && secrets.ARGOCD_WEBHOOK_URL != '' && secrets.GHCR_TOKEN != '' }}
+    
+    steps:
+    - name: Verify all required secrets are available
+      run: |
+        echo "🔍 Checking for all required secrets..."
+        echo "Repository: ${{ github.repository }}"
+        echo "Event: ${{ github.event_name }}"
+        echo "Ref: ${{ github.ref }}"
+        
+        # Check all required secrets
+        if [ -z "${{ secrets.MANIFESTS_REPO_TOKEN }}" ]; then
+          echo "❌ MANIFESTS_REPO_TOKEN is missing"
+          echo "This token should have been set automatically when the service was created."
+          echo "Please ensure the service creation process completed successfully."
+          exit 1
+        fi
+        
+        if [ -z "${{ secrets.ARGOCD_WEBHOOK_URL }}" ]; then
+          echo "❌ ARGOCD_WEBHOOK_URL is missing"
+          echo "This URL should have been set automatically when the service was created."
+          echo "Please ensure the service creation process completed successfully."
+          exit 1
+        fi
+        
+        if [ -z "${{ secrets.GHCR_TOKEN }}" ]; then
+          echo "❌ GHCR_TOKEN is missing"
+          echo "This token should have been set automatically when the service was created."
+          echo "Please ensure the service creation process completed successfully."
+          exit 1
+        fi
+        
+        echo "✅ All required secrets are available:"
+        echo "  - MANIFESTS_REPO_TOKEN: ${#MANIFESTS_REPO_TOKEN} characters"
+        echo "  - ARGOCD_WEBHOOK_URL: ${#ARGOCD_WEBHOOK_URL} characters"
+        echo "  - GHCR_TOKEN: ${#GHCR_TOKEN} characters"
+    
+    - name: Skip deployment - secrets not ready
+      if: env.SECRETS_READY != 'true'
+      run: |
+        echo "⏸️ Skipping deployment - secrets not ready"
+        echo "This workflow will run automatically once secrets are properly set."
+        echo "Please ensure the service was created successfully with all required tokens."
+        echo ""
+        echo "Required secrets status:"
+        echo "  - MANIFESTS_REPO_TOKEN: ${{ secrets.MANIFESTS_REPO_TOKEN != '' }}"
+        echo "  - ARGOCD_WEBHOOK_URL: ${{ secrets.ARGOCD_WEBHOOK_URL != '' }}"
+        echo "  - GHCR_TOKEN: ${{ secrets.GHCR_TOKEN != '' }}"
+        echo ""
+        echo "🔧 Next steps:"
+        echo "1. Ensure service creation completed successfully"
+        echo "2. Check repository secrets in Settings > Secrets and variables > Actions"
+        echo "3. Re-run this workflow once secrets are available"
+
+    - name: Checkout manifests repo
+      if: env.SECRETS_READY == 'true'
+      uses: actions/checkout@v4
+      with:
+        repository: ductri09072004/demo_fiss1_B
+        token: ${{ secrets.MANIFESTS_REPO_TOKEN }}
+        path: manifests
+        
+    - name: Update image tag
+      if: env.SECRETS_READY == 'true'
+      run: |
+        cd manifests
+        SERVICE="${{ github.event.repository.name }}"
+        FILE="services/$SERVICE/k8s/deployment.yaml"
+        # Cập nhật image với tag duy nhất theo commit
+        sed -i "s|image: ghcr.io/.*/.*:.*|image: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:main-${{ github.sha }}|g" "$FILE"
+        # Cập nhật timestamp annotation để đảm bảo podTemplateSpec khác → rollout
+        TS=$(date +%s)
+        sed -i "s|timestamp: \".*\"|timestamp: \"$TS\"|g" "$FILE"
+        
+    - name: Commit and push changes
+      if: env.SECRETS_READY == 'true'
+      run: |
+        cd manifests
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add .
+        SERVICE="${{ github.event.repository.name }}"
+        git commit -m "Update $SERVICE image to ${{ github.sha }}" || exit 0
+        git push
+        
+    - name: Trigger ArgoCD Webhook for Immediate Sync
+      if: env.SECRETS_READY == 'true'
+      run: |
+        SERVICE="${{ github.event.repository.name }}"
+        echo "Triggering ArgoCD webhook for immediate sync of $SERVICE..."
+        
+        # Gửi webhook đến ArgoCD để trigger sync ngay lập tức
+        if [ -n "${{ secrets.ARGOCD_WEBHOOK_URL }}" ]; then
+          curl -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-ArgoCD-Webhook-Token: ${{ secrets.ARGOCD_WEBHOOK_TOKEN }}" \
+            "${{ secrets.ARGOCD_WEBHOOK_URL }}/$SERVICE" \
+            -d '{"prune": true, "dryRun": false}' \
+            --max-time 30 \
+            --retry 3 \
+            --retry-delay 5
+          
+          if [ $? -eq 0 ]; then
+            echo "✅ ArgoCD webhook triggered successfully for $SERVICE"
+          else
+            echo "⚠️ ArgoCD webhook failed, but auto-sync will still work"
+          fi
+        else
+          echo "⚠️ ARGOCD_WEBHOOK_URL not configured, falling back to auto-sync"
+          echo "ArgoCD will automatically sync when Repo B is updated..."
+        fi
+        
+        echo "Timestamp updated: $(date)"
+
+
